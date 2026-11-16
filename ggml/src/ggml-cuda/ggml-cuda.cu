@@ -2460,6 +2460,11 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
     const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
     const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
+    // [TAG_GGML_PREC] the fused kernel is MMQ: with a wide src1 only for the types with fp32 scales
+    if ((ggml_cuda_mul_mat_src1_wide(x_up, up) && !ggml_cuda_mmq_has_f32_scale(x_up->type)) ||
+            (ggml_cuda_mul_mat_src1_wide(gate->src[0], gate) && !ggml_cuda_mmq_has_f32_scale(gate->src[0]->type))) {
+        return false;
+    }
     // do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat
     if (!is_id && ggml_cuda_should_use_mmq_few(x_up, y, cc)) {
         return false;
@@ -6329,10 +6334,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const bool fp8_id_mmvf = op->op == GGML_OP_MUL_MAT_ID &&
                     a->type == GGML_TYPE_F8_E4M3 && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                     ggml_cuda_should_use_mmvf(a, cc_dev, ggml_cuda_info().devices[dev_ctx->device].warp_size, b->ne[2]);
-                if (prec_src1 == GGML_PREC_F32 && !fp8_id_mmvf && (op->op == GGML_OP_MUL_MAT_ID || !f32_src1_ok || a->type != GGML_TYPE_F32)) {
+                // [TAG_GGML_PREC] quantized weights with a wide src1 are routed to MMQ with fp32 scales or to cuBLAS
+                const bool src1_wide_ok = ggml_cuda_mul_mat_src1_wide(a, op) && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                if (prec_src1 == GGML_PREC_F32 && !fp8_id_mmvf && !src1_wide_ok && (op->op == GGML_OP_MUL_MAT_ID || !f32_src1_ok || a->type != GGML_TYPE_F32)) {
                     return false;
                 }
-                if (prec_src1 == GGML_PREC_BF16 && (op->op == GGML_OP_MUL_MAT_ID || a->type != GGML_TYPE_F32)) {
+                if (prec_src1 == GGML_PREC_BF16 && !src1_wide_ok && (op->op == GGML_OP_MUL_MAT_ID || a->type != GGML_TYPE_F32)) {
                     return false;
                 }
 #ifdef GGML_USE_MUSA
