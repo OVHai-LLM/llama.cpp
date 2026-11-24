@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-f32.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1897,6 +1898,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        if (ggml_cuda_should_use_mmvq_f32(src0, src1, dst)) {
+            ggml_cuda_mul_mat_vec_q_f32(ctx, src0, src1, dst);
+            return;
+        }
         if (ggml_cuda_mmq_has_f32_scale(src0->type) && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         } else {
@@ -1915,17 +1920,36 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_QKK_64)
+void ggml_cuda_mul_mat_direct(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32 &&
+        (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+    ggml_cuda_mul_mat(ctx, src0, src1, dst);
+}
+#endif
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
 
     if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        if (ggml_cuda_should_use_mmvq_f32_id(src0, src1, ids, dst)) {
+            return false;
+        }
         return !(ggml_cuda_mmq_has_f32_scale(src0->type) &&
                  ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]));
     }
@@ -1966,6 +1990,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     const bool src1_wide = ggml_cuda_mul_mat_src1_wide(src0, dst);
     if (src1_wide) {
+        if (ggml_cuda_should_use_mmvq_f32_id(src0, src1, ids, dst)) {
+            ggml_cuda_mul_mat_vec_q_f32_id(ctx, src0, src1, ids, dst);
+            return;
+        }
         if (ggml_cuda_mmq_has_f32_scale(src0->type) && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
@@ -2313,6 +2341,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_OLALA_MOE:
+            ggml_cuda_op_olala_moe(ctx, dst);
+            break;
+        case GGML_OP_OLALA_MMV:
+            ggml_cuda_op_olala_mmv(ctx, dst);
+            break;
+        case GGML_OP_OLALA_TPA_PREP:
+            ggml_cuda_op_olala_tpa_prep(ctx, dst);
+            break;
+        case GGML_OP_OLALA_DIFF_GATE:
+            ggml_cuda_op_olala_diff_gate(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -2871,6 +2911,66 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    return skip;
+}
+
+static int ggml_cuda_try_mamba3_cache_fusion(
+        const ggml_cgraph * cgraph, int node_idx, float *& fused_s_out, int64_t & fused_s_out_stride) {
+    const ggml_tensor * m3 = cgraph->nodes[node_idx];
+    if (m3->op != GGML_OP_MAMBA3_MIMO || m3->type != GGML_TYPE_F32 || (m3->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * state_in = m3->src[7];
+    const int64_t n_embd_s = state_in->ne[0];
+    const int64_t n_seqs   = state_in->ne[1];
+    const int64_t n_tok    = m3->src[0]->ne[1];
+    const int64_t D_v      = m3->src[4]->ne[0];
+    const int64_t H        = m3->src[4]->ne[2];
+    const size_t  tail_off = (size_t) (D_v * H * n_tok) * sizeof(float);
+
+    const ggml_tensor * cpy = nullptr;
+    int skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0];
+    const ggml_tensor * dst = cpy->src[1];
+    if (src->op != GGML_OP_VIEW || src->view_src != m3 || src->view_offs != tail_off || !ggml_is_contiguous(src)) {
+        return 0;
+    }
+    if (dst->type != GGML_TYPE_F32 || dst->data == nullptr || dst->nb[0] != sizeof(float) ||
+        (dst->nb[1] % sizeof(float)) != 0u ||
+        dst->ne[0] != n_embd_s || dst->ne[1] != n_seqs || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return 0;
+    }
+    const int64_t T = n_tok / n_seqs;
+    if (dst->data == state_in->data) {
+        if (dst->nb[1] != state_in->nb[1] || T >= 64) {
+            return 0;
+        }
+    } else {
+        const uintptr_t u_in  = reinterpret_cast<uintptr_t>(state_in->data);
+        const uintptr_t u_dst = reinterpret_cast<uintptr_t>(dst->data);
+        const uintptr_t in_b  = (uintptr_t) n_seqs * state_in->nb[1];
+        const uintptr_t dst_b = (uintptr_t) n_seqs * dst->nb[1];
+        if (u_in < u_dst + dst_b && u_dst < u_in + in_b) {
+            return 0;
+        }
+    }
+    fused_s_out        = static_cast<float *>(dst->data);
+    fused_s_out_stride = static_cast<int64_t>(dst->nb[1] / sizeof(float));
     return skip;
 }
 
@@ -3536,6 +3636,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // mamba3_mimo -> cpy: write updated state directly into cache
+    if (node->op == GGML_OP_MAMBA3_MIMO) {
+        float * fused_s_out = nullptr;
+        int64_t fused_s_out_stride = 0;
+        const int nodes_to_skip = ggml_cuda_try_mamba3_cache_fusion(cgraph, i, fused_s_out, fused_s_out_stride);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_mamba3_mimo(*cuda_ctx, node, fused_s_out, fused_s_out_stride);
             return nodes_to_skip;
         }
     }
@@ -5276,6 +5387,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_OLALA_MOE:
+            return ggml_cuda_supports_olala_moe(op);
+        case GGML_OP_OLALA_MMV:
+            return ggml_cuda_supports_olala_mmv(op);
+        case GGML_OP_OLALA_TPA_PREP:
+            return ggml_cuda_supports_olala_tpa_prep(op);
+        case GGML_OP_OLALA_DIFF_GATE:
+            return ggml_cuda_supports_olala_diff_gate(op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -5707,7 +5826,12 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_GET_ROWS:
             return 0;
         case GGML_OP_MUL_MAT:
+        case GGML_OP_OLALA_MOE:
+        case GGML_OP_OLALA_MMV:
             return op->ne[1];
+        case GGML_OP_OLALA_TPA_PREP:
+        case GGML_OP_OLALA_DIFF_GATE:
+            return 0;
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:

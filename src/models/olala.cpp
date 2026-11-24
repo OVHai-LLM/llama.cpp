@@ -72,7 +72,9 @@ static bool olala_state_bf16() { return olala_state_mode() != OLALA_STATE_F32; }
 static thread_local bool olala_layer_cpu = true;
 // the layer runs on the Metal backend, which implements GGML_OP_OLALA_MOE (3 dispatches)
 static thread_local bool olala_layer_metal = false;
+static thread_local bool olala_layer_cuda  = false;
 static thread_local ggml_backend_dev_t olala_layer_dev = nullptr;
+static constexpr int64_t OLALA_CUDA_MAX_TOKENS = 512;
 
 // the Metal Olala kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
 // (OLALA_NO_FUSED_MOE forces the graph path for the MoE)
@@ -2951,9 +2953,11 @@ static ggml_tensor * build_olala_m_mixer_real(
                                        !olala_env_on("OLALA_M_COLSPLIT") && !olala_env_on("OLALA_NO_INPLACE_STATE");
     const bool state_inplace = inplace_env_ok && !olala_use_ggml_op() && olala_state_mode() == OLALA_STATE_F32;
     // GPU decode (one token per sequence) when every sequence reads its own cache row: the ggml op reads the state
-    // straight from the cache rows it then overwrites (the Metal serial kernel loads the whole state of a (head,
+    // straight from the cache rows it then overwrites (the Metal/CUDA serial kernel loads the whole state of a (head,
     // sequence) before writing it), no gather copy.
-    const bool state_view = !state_inplace && inplace_env_ok && olala_use_ggml_op() && olala_layer_metal &&
+    static const bool disable_cuda_state_view = olala_env_on("OLALA_DISABLE_CUDA_STATE_VIEW");
+    const bool use_cuda_state_view = olala_layer_cuda && !disable_cuda_state_view;
+    const bool state_view = !state_inplace && inplace_env_ok && olala_use_ggml_op() && (olala_layer_metal || use_cuda_state_view) &&
                             olala_state_mode() == OLALA_STATE_F32 && n_tokens == (int64_t) gctx.ubatch.n_seqs &&
                             inp_rs->s_copy_ident;
     ggml_tensor * rs_states = nullptr, * rs_ids = nullptr;
@@ -3017,9 +3021,24 @@ static ggml_tensor * build_olala_m_mixer_real(
                              layer.ssm_in->type == GGML_TYPE_BF16 &&
                              layer.wo->type == GGML_TYPE_BF16;
 
-    // 1) Static projection: ssm_in @ cur → (H · (2·D_v + 3), L).
+    // 1) Static & Dynamic projections: fuse ssm_in + ssm_in_dyn via ggml_olala_mmv on CUDA for n_tokens == 1
+    //    (for n_tokens > 1, view_2d slices of m_pr are non-contiguous and break downstream reshape_3d / mamba3_mimo strides)
     ggml_tensor * proj_static = nullptr;
-    if (!mega_decode) {
+    ggml_tensor * proj_dyn    = nullptr;
+    if (!mega_decode && olala_layer_cuda && n_tokens == 1) {
+        ggml_tensor * m_wlist[2] = { layer.ssm_in, layer.ssm_in_dyn };
+        ggml_tensor * m_pr = ggml_olala_mmv(ctx, cur, m_wlist, 2);
+        if (ggml_backend_dev_supports_op(olala_layer_dev, m_pr)) {
+            ggml_set_name(m_pr, "m_proj_fused");
+            const int64_t r0 = layer.ssm_in->ne[1];
+            const int64_t r1 = layer.ssm_in_dyn->ne[1];
+            proj_static = ggml_view_2d(ctx, m_pr, r0, n_tokens, m_pr->nb[1], 0);
+            proj_dyn    = ggml_view_2d(ctx, m_pr, r1, n_tokens, m_pr->nb[1], static_cast<size_t>(r0) * m_pr->nb[0]);
+            ggml_set_name(proj_static, "m_in_proj");
+            ggml_set_name(proj_dyn, "m_proj_dyn");
+        }
+    }
+    if (!mega_decode && proj_static == nullptr) {
         proj_static = ggml_mul_mat(ctx, layer.ssm_in, cur);
         ggml_set_name(proj_static, "m_in_proj");
     }
@@ -3047,8 +3066,10 @@ static ggml_tensor * build_olala_m_mixer_real(
 
     // 2) Dynamic projection: ssm_in_dyn @ cur → (2·R·G·D_qk + num_angles, L),
     //    laid out as [B(R·G·D_qk) | C(R·G·D_qk) | angle(num_angles)] along ne[0].
-    ggml_tensor * proj_dyn = ggml_mul_mat(ctx, layer.ssm_in_dyn, cur);
-    ggml_set_name(proj_dyn, "m_proj_dyn");
+    if (proj_dyn == nullptr) {
+        proj_dyn = ggml_mul_mat(ctx, layer.ssm_in_dyn, cur);
+        ggml_set_name(proj_dyn, "m_proj_dyn");
+    }
     const int64_t BC_size = R * G * D_qk;
     ggml_tensor * B_flat = ggml_view_2d(ctx, proj_dyn, BC_size, n_tokens,
                                         proj_dyn->nb[1], /*off*/ 0);
@@ -3537,10 +3558,16 @@ static ggml_tensor * build_olala_v_mixer(
         return v_out;
     }
 
-    // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
+    // Metal & CUDA: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
     // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.
     ggml_tensor * pr = nullptr;
-    if (olala_layer_metal && layer.attn_shift_k != nullptr && n_tokens <= OLALA_METAL_MAX_TOKENS) {
+    const int64_t v_fused_max = olala_layer_cuda ? 8 : OLALA_METAL_MAX_TOKENS;
+    const bool cuda_v_ok = olala_layer_cuda && !gctx.cparams.tpa_factored &&
+                           head_dim <= 256 && rank <= 8 &&
+                           layer.attn_q_norm->type == GGML_TYPE_F32 &&
+                           layer.attn_k_norm->type == GGML_TYPE_F32 &&
+                           layer.attn_softmax_scaler->type == GGML_TYPE_F32;
+    if ((olala_layer_metal || cuda_v_ok) && layer.attn_shift_k != nullptr && n_tokens <= v_fused_max) {
         ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
                                    layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
         pr = ggml_olala_mmv(ctx, cur, wlist, 9);
@@ -3835,6 +3862,9 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
             olala_layer_metal = !force_portable && dev != nullptr &&
                 ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "MTL") == 0;
+            olala_layer_cuda = !force_portable && dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
         }
 
         // Optional per-block dump for HF↔llama.cpp comparison, gated on OLALA_DUMP_DIR.
@@ -3869,10 +3899,14 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
         // ubatch size (it processes pairs grouped by expert, fine for prefill too)
         const bool lazy_experts = model.can_prefetch.count(model.layers[il].ffn_up_exps) > 0 &&
                                   model.can_prefetch.count(model.layers[il].ffn_down_exps) > 0;
+        static const bool disable_cuda_moe = olala_env_on("OLALA_DISABLE_CUDA_MOE");
         const bool metal_moe = olala_layer_metal && !lazy_experts && cur->ne[1] <= OLALA_METAL_MAX_TOKENS;
+        const bool cuda_moe  = olala_layer_cuda && !lazy_experts &&
+                              cur->ne[1] <= OLALA_CUDA_MAX_TOKENS &&
+                              !disable_cuda_moe;
         // (lazy experts on a GPU layer: the CPU fused op too - the only path that pages the experts in and out)
-        const bool use_moe_op = (olala_layer_cpu || metal_moe || lazy_experts) && !force_no_fused_moe && !olala_dump_dir() &&
-            (cur->ne[1] <= olala_fused_moe_max_tokens() || lazy_experts || metal_moe) &&
+        const bool use_moe_op = (olala_layer_cpu || metal_moe || cuda_moe || lazy_experts) && !force_no_fused_moe && !olala_dump_dir() &&
+            (cur->ne[1] <= olala_fused_moe_max_tokens() || lazy_experts || metal_moe || cuda_moe) &&
             !olala_tensor_repacked(model.layers[il].ffn_latent_down) &&
             !olala_tensor_repacked(model.layers[il].ffn_up_exps) &&
             !olala_tensor_repacked(model.layers[il].ffn_down_exps) &&
@@ -3894,9 +3928,8 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].ffn_down_shexp,
                     (int) n_expert_used, hparams.expert_weights_scale,
                     lazy_experts ? olala_expert_cache_mib(model) : -1);
-            // a Metal layer whose weights the Metal kernels cannot read (e.g. Q5_K experts) takes the graph path below:
-            // the op would otherwise fall back to the CPU, one round trip per layer
-            if (metal_moe && !lazy_experts && !ggml_backend_dev_supports_op(olala_layer_dev, moe_op)) {
+            // a GPU/Metal layer whose weights the kernels cannot read takes the graph path below:
+            if ((metal_moe || cuda_moe) && !lazy_experts && !ggml_backend_dev_supports_op(olala_layer_dev, moe_op)) {
                 moe_op = nullptr;
             }
         }
