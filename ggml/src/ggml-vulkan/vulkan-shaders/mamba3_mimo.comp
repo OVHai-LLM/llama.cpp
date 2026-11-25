@@ -1,0 +1,256 @@
+#version 450
+
+// Olala Mamba3-MIMO mixer, result form (see ggml_mamba3_mimo in ggml.h).
+// Reference: ggml_compute_forward_mamba3_mimo in ggml/src/ggml-cpu/ops.cpp. The float arithmetic follows ggml/src/ggml-cuda/mamba3-mimo.cu.
+// One workgroup per (head, sequence) runs the tokens of the sequence in order. NSL invocations own state row p.
+// With w[r] = mimo_o[r,p]*silu(z[r,p]) the R output contractions fold into one, as in m3_step on the CPU:
+//   y[p] = sum_d S[p,d]*(sum_r w[r]*q[r,d]) + D*sum_r w[r]*v[r,p]
+// REG = 1 keeps the state in registers for the whole sequence. REG = 0 reads and writes it in dst every token.
+
+#define NTH   256
+#define MAX_R 8
+
+layout(constant_id = 0) const uint R    = 4;   // MIMO rank, <= MAX_R
+layout(constant_id = 1) const uint D_QK = 128; // multiple of 4, <= 4*NTH
+layout(constant_id = 2) const uint D_V  = 64;  // D_V*NSL <= NTH
+layout(constant_id = 3) const uint NSL  = 4;   // invocations per state row
+layout(constant_id = 4) const uint REG  = 0;   // 1: state stays in registers across tokens
+
+layout(local_size_x = NTH, local_size_y = 1, local_size_z = 1) in;
+
+const uint N_ANG  = D_QK / 4;
+const uint SD     = D_QK * D_V;
+const uint TPG    = NTH / (2 * R);     // invocations per rms group
+const uint SREG   = (D_QK + NSL - 1) / NSL; // state elements per invocation
+
+layout(binding = 0) readonly buffer Pdyn  { float pdyn[];   };
+layout(binding = 1) readonly buffer Pstat { float pstat[];  };
+layout(binding = 2) readonly buffer Bias  { float bias[];   };
+layout(binding = 3) readonly buffer Mxz   { float mxz[];    };
+layout(binding = 4) readonly buffer MimoO { float mimo_o[]; };
+layout(binding = 5) readonly buffer Norms { float norms[];  };
+layout(binding = 6) readonly buffer Misc  { float misc[];   };
+layout(binding = 7) readonly buffer State { float s_in[];   };
+layout(binding = 8) buffer Dst            { float dst[];    };
+
+layout(push_constant) uniform PushConstants {
+    // misalignment of each binding, in floats
+    uint o_pdyn; uint o_pstat; uint o_bias; uint o_mxz; uint o_mimo; uint o_norms; uint o_misc; uint o_state; uint o_dst;
+    uint pdyn_s;   // token strides, in floats
+    uint pstat_s;
+    uint s_in_s;   // sequence stride of the input state, in floats
+    uint H;
+    uint T;        // tokens per sequence
+    uint n_embd_s;
+    uint y_size;   // D_V*H*n_tok: offset of the new state inside dst
+    float eps;
+    float a_floor;
+};
+
+shared float kb[2 * R * D_QK]; // k of the previous and of the current token
+shared float qb[R * D_QK];
+shared float vb[2 * R * D_V];
+shared float zb[R * D_V];
+shared float cs[N_ANG];
+shared float sn[N_ANG];
+shared float rms[2 * R];
+shared float rpart[NTH];
+shared float apart[NTH];
+
+float softplus(float x) {
+    return max(x, 0.0) + log(exp(-abs(x)) + 1.0);
+}
+
+float wrap_angle(float a) {
+    return a - 6.283185307179586 * roundEven(a * 0.15915494309189535);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h   = gl_WorkGroupID.y;
+    const uint seq = gl_WorkGroupID.z;
+
+    const uint off_K = H * SD;
+    const uint off_V = off_K + H * R * D_QK;
+    const uint off_A = off_V + H * R * D_V;
+
+    const uint si   = o_state + seq * s_in_s;        // input state of this sequence
+    const uint so   = o_dst + y_size + seq * n_embd_s; // output state of this sequence
+    const uint tok0 = seq * T;
+
+    const uint b_h  = o_bias + h * 2 * R * D_QK;
+    const uint mx_h = o_mxz  + h * 2 * R * D_V;
+    const uint mo_h = o_mimo + h * R * D_V;
+
+    // previous token's k/v come from the cache
+    uint prv = 1;
+    for (uint j = tid; j < R * D_QK; j += NTH) {
+        kb[prv * R * D_QK + j] = s_in[si + off_K + h * R * D_QK + j];
+    }
+    for (uint j = tid; j < R * D_V; j += NTH) {
+        vb[prv * R * D_V + j] = s_in[si + off_V + h * R * D_V + j];
+    }
+    float ang = 0.0; // invocation tid < N_ANG owns rotary phase tid
+    if (tid < N_ANG) {
+        ang = s_in[si + off_A + h * N_ANG + tid];
+    }
+    barrier();
+
+    const float dt_bias = misc[o_misc + h];
+    const float D_h     = misc[o_misc + H + h];
+
+    const uint p  = tid / NSL; // state row
+    const uint sl = tid % NSL; // slice of the row
+    const uint sp = h * SD + p * D_QK;
+
+    float sreg[SREG];
+    if (REG != 0 && p < D_V) {
+        for (uint i = 0, d = sl; d < D_QK; ++i, d += NSL) {
+            sreg[i] = s_in[si + sp + d];
+        }
+    }
+    const uint g  = tid / TPG; // rms group
+    const uint gl = tid % TPG;
+
+    for (uint t = 0; t < T; ++t) {
+        const uint tok = tok0 + t;
+        const uint cur = prv ^ 1;
+        const uint pd  = o_pdyn  + tok * pdyn_s;
+        const uint ps  = o_pstat + tok * pstat_s + h * (2 * D_V + 3);
+
+        const float dt    = softplus(pstat[ps + 2 * D_V] + dt_bias);
+        const float a     = min(-softplus(pstat[ps + 2 * D_V + 1]), -a_floor);
+        const float alpha = exp(a * dt);
+        const float trap  = 1.0 / (1.0 + exp(-pstat[ps + 2 * D_V + 2]));
+        const float beta  = (1.0 - trap) * dt * alpha;
+        const float gamma = trap * dt;
+
+        if (tid < N_ANG) {
+            ang = wrap_angle(ang + tanh(pdyn[pd + 2 * R * D_QK + tid]) * 3.14159265358979 * dt);
+            cs[tid] = cos(ang);
+            sn[tid] = sin(ang);
+        }
+
+        // rms scales of the 2R groups of B/C
+        {
+            float s = 0.0;
+            for (uint d = gl; d < D_QK; d += TPG) {
+                const float x = pdyn[pd + g * D_QK + d];
+                s += x * x;
+            }
+            rpart[tid] = s;
+        }
+        barrier();
+        if (tid < 2 * R) {
+            float s = 0.0;
+            for (uint i = 0; i < TPG; ++i) {
+                s += rpart[tid * TPG + i];
+            }
+            rms[tid] = inversesqrt(s / float(D_QK) + eps);
+        }
+        barrier();
+
+        // operands: k (B groups) and q (C groups) with weight, bias and rotary; v and z
+        const uint half_d = D_QK / 2, quarter = D_QK / 4;
+        for (uint j = tid; j < 2 * R * D_QK; j += NTH) {
+            const uint  gg  = j / D_QK;
+            const uint  d   = j % D_QK;
+            const uint  src = pd + gg * D_QK;
+            const uint  w   = o_norms + (gg < R ? 0 : D_QK);
+            const uint  b   = b_h + gg * D_QK;
+            const float sc  = rms[gg];
+            float o;
+            if (d < quarter) {
+                const float v0 = pdyn[src + d] * sc * norms[w + d] + bias[b + d];
+                const float v2 = pdyn[src + d + half_d] * sc * norms[w + d + half_d] + bias[b + d + half_d];
+                o = v0 * cs[d] - v2 * sn[d];
+            } else if (d >= half_d && d < half_d + quarter) {
+                const uint  i  = d - half_d;
+                const float v0 = pdyn[src + i] * sc * norms[w + i] + bias[b + i];
+                const float v2 = pdyn[src + d] * sc * norms[w + d] + bias[b + d];
+                o = v0 * sn[i] + v2 * cs[i];
+            } else {
+                o = pdyn[src + d] * sc * norms[w + d] + bias[b + d];
+            }
+            if (gg < R) {
+                kb[cur * R * D_QK + j] = o;
+            } else {
+                qb[j - R * D_QK] = o;
+            }
+        }
+        for (uint j = tid; j < R * D_V; j += NTH) {
+            const uint pp = j % D_V;
+            vb[cur * R * D_V + j] = pstat[ps + D_V + pp] * mxz[mx_h + j];
+            zb[j]                 = pstat[ps + pp] * mxz[mx_h + R * D_V + j];
+        }
+        barrier();
+
+        // state update and the partial output contraction of row p
+        float skip = 0.0;
+        if (p < D_V) {
+            float vc[MAX_R], vp[MAX_R], w[MAX_R];
+            for (uint r = 0; r < R; ++r) {
+                vc[r] = vb[cur * R * D_V + r * D_V + p];
+                vp[r] = vb[prv * R * D_V + r * D_V + p];
+                const float zv = zb[r * D_V + p];
+                w[r]  = mimo_o[mo_h + r * D_V + p] * (zv / (1.0 + exp(-zv)));
+                skip += w[r] * vc[r];
+            }
+            const uint kc = cur * R * D_QK;
+            const uint kp = prv * R * D_QK;
+            float acc = 0.0;
+            for (uint i = 0, d = sl; d < D_QK; ++i, d += NSL) {
+                float c_acc = 0.0, p_acc = 0.0, qw = 0.0;
+                for (uint r = 0; r < R; ++r) {
+                    c_acc += vc[r] * kb[kc + r * D_QK + d];
+                    p_acc += vp[r] * kb[kp + r * D_QK + d];
+                    qw    += w[r]  * qb[r * D_QK + d];
+                }
+                float s;
+                if (REG != 0) {
+                    s = sreg[i];
+                } else if (t == 0) {
+                    s = s_in[si + sp + d];
+                } else {
+                    s = dst[so + sp + d];
+                }
+                s = alpha * s + beta * p_acc + gamma * c_acc;
+                if (REG != 0) {
+                    sreg[i] = s;
+                } else {
+                    dst[so + sp + d] = s;
+                }
+                acc += s * qw;
+            }
+            apart[tid] = acc;
+        }
+        barrier();
+
+        // Sum the row's partials, then add the D skip, as on the CPU.
+        // Nothing read here is written before the second barrier of the next token.
+        if (sl == 0 && p < D_V) {
+            float yp = 0.0;
+            for (uint i = 0; i < NSL; ++i) {
+                yp += apart[tid + i];
+            }
+            dst[o_dst + (tok * H + h) * D_V + p] = yp + D_h * skip;
+        }
+        prv = cur;
+    }
+
+    // k/v of the last token feed the next ubatch's trapezoid term
+    for (uint j = tid; j < R * D_QK; j += NTH) {
+        dst[so + off_K + h * R * D_QK + j] = kb[prv * R * D_QK + j];
+    }
+    for (uint j = tid; j < R * D_V; j += NTH) {
+        dst[so + off_V + h * R * D_V + j] = vb[prv * R * D_V + j];
+    }
+    if (tid < N_ANG) {
+        dst[so + off_A + h * N_ANG + tid] = ang;
+    }
+    if (REG != 0 && p < D_V) {
+        for (uint i = 0, d = sl; d < D_QK; ++i, d += NSL) {
+            dst[so + sp + d] = sreg[i];
+        }
+    }
+}

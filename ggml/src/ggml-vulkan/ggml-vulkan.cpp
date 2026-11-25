@@ -3741,6 +3741,18 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    // geodesic.comp accumulates its row sums in double, as the CPU does
+    if (device->shader_float64) {
+        ggml_vk_create_pipeline(device, device->pipeline_geodesic_f32, "geodesic_f32", geodesic_f32_len, geodesic_f32_data, "main", 5, sizeof(vk_op_geodesic_push_constants), {1, 1, 1}, {}, 1, true);
+    }
+
+    for (auto &m : device->pipeline_mamba3_mimo_f32) {
+        const std::string name = "mamba3_mimo_f32_r" + std::to_string(m.first[0]) + "_qk" + std::to_string(m.first[1]) + "_v" + std::to_string(m.first[2]) +
+                                 "_s" + std::to_string(m.first[3]) + (m.first[4] ? "_reg" : "");
+        ggml_vk_create_pipeline2(device, m.second, name, mamba3_mimo_f32_len, mamba3_mimo_f32_data, "main", 9, sizeof(vk_op_mamba3_mimo_push_constants), {1, 1, 1},
+                                 {m.first[0], m.first[1], m.first[2], m.first[3], m.first[4]}, 1, true);
+    }
+
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size}, 1, true, true);
@@ -4521,6 +4533,7 @@ vk_device ggml_vk_get_device(size_t idx) {
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
         device->shader_int64 = device_features2.features.shaderInt64;
+        device->shader_float64 = device_features2.features.shaderFloat64;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
 
@@ -10260,6 +10273,123 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         pc, { H, n_seqs, S_v });
 }
 
+// invocations per state row and whether the state stays in registers, for mamba3_mimo.comp
+static void ggml_vk_mamba3_mimo_layout(uint32_t D_qk, uint32_t D_v, uint32_t T, uint32_t & nsl, uint32_t & reg) {
+    nsl = 1;
+    while (nsl * 2 * D_v <= 256 && nsl * 2 <= D_qk) {
+        nsl *= 2;
+    }
+    // with one token the state is read and written once either way
+    reg = T > 1 && CEIL_DIV(D_qk, nsl) <= 64 ? 1 : 0;
+}
+
+// A binding starts at the aligned offset at or before the tensor. The shader indexes it in floats with 32-bit indices.
+// Returns true when the tensor plus the largest such prefix fits.
+static bool ggml_vk_float_binding_supported(const vk_device& device, const ggml_tensor * t) {
+    const uint64_t range  = device->properties.limits.maxStorageBufferRange;
+    const uint64_t prefix = device->properties.limits.minStorageBufferOffsetAlignment - 1;
+    const uint64_t size   = ggml_nbytes(t);
+    return size <= range && prefix <= range - size && (size + prefix) / sizeof(float) <= UINT32_MAX;
+}
+
+// shared memory used by mamba3_mimo.comp, in bytes: kb, qb, vb, zb, cs, sn, rms, rpart, apart
+static size_t ggml_vk_mamba3_mimo_shmem(uint32_t R, uint32_t D_qk, uint32_t D_v) {
+    return sizeof(float) * ((size_t) 3*R*D_qk + 3*R*D_v + 2*(D_qk/4) + 2*R + 2*256);
+}
+
+// result form only: dst = y (D_v, H, n_tok) followed by the new state rows
+static void ggml_vk_mamba3_mimo(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * pdyn   = dst->src[0];
+    const ggml_tensor * pstat  = dst->src[1];
+    const ggml_tensor * bias   = dst->src[2];
+    const ggml_tensor * mimo_o = dst->src[4];
+    const ggml_tensor * state  = dst->src[7];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(dst->src[8] == nullptr);
+
+    const uint32_t D_qk     = bias->ne[0];
+    const uint32_t D_v      = mimo_o->ne[0];
+    const uint32_t R        = mimo_o->ne[1];
+    const uint32_t H        = mimo_o->ne[2];
+    const uint32_t n_tok    = pdyn->ne[1];
+    const uint32_t n_seqs   = state->ne[1];
+    const uint32_t T        = n_tok / n_seqs;
+    const uint32_t n_embd_s = H*(D_v*D_qk + R*D_qk + R*D_v + D_qk/4); // packed new state row, as on the CPU
+
+    uint32_t nsl, reg;
+    ggml_vk_mamba3_mimo_layout(D_qk, D_v, T, nsl, reg);
+
+    vk_pipeline pipeline = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+        auto &pipelines = ctx->device->pipeline_mamba3_mimo_f32;
+        const std::array<uint32_t, 5> key = { R, D_qk, D_v, nsl, reg };
+        auto it = pipelines.find(key);
+        if (it != pipelines.end()) {
+            pipeline = it->second;
+        } else {
+            pipelines[key] = pipeline = std::make_shared<vk_pipeline_struct>();
+        }
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer buf[8];
+    uint32_t     off[8];
+    for (int i = 0; i < 8; i++) {
+        buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i], true);
+        off[i] = get_misalign_bytes(ctx, dst->src[i]) / sizeof(float);
+    }
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    const vk_op_mamba3_mimo_push_constants pc = {
+        off[0], off[1], off[2], off[3], off[4], off[5], off[6], off[7],
+        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float)),
+        (uint32_t) (pdyn->nb[1] / sizeof(float)), (uint32_t) (pstat->nb[1] / sizeof(float)),
+        (uint32_t) (state->nb[1] / sizeof(float)),
+        H, T, n_embd_s, D_v * H * n_tok,
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], dst_buf },
+        pc, { 1, H, n_seqs });
+}
+
+static void ggml_vk_geodesic(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * g = dst->src[1];
+    const ggml_tensor * s = dst->src[2];
+    const ggml_tensor * b = dst->src[3];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_geodesic_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t nr = ggml_nrows(x);
+    const size_t   fs = sizeof(float);
+
+    const vk_op_geodesic_push_constants pc = {
+        (uint32_t) (get_misalign_bytes(ctx, x) / fs), (uint32_t) (get_misalign_bytes(ctx, g) / fs),
+        (uint32_t) (get_misalign_bytes(ctx, s) / fs), (uint32_t) (get_misalign_bytes(ctx, b) / fs),
+        (uint32_t) (get_misalign_bytes(ctx, dst) / fs),
+        (uint32_t) x->ne[0], nr, (uint32_t) x->ne[1], (uint32_t) x->ne[2],
+        (uint32_t) (x->nb[1] / fs),   (uint32_t) (x->nb[2] / fs),   (uint32_t) (x->nb[3] / fs),
+        (uint32_t) (g->nb[1] / fs),   (uint32_t) (g->nb[2] / fs),   (uint32_t) (g->nb[3] / fs),
+        ggml_get_op_params_f32(dst, 0),
+    };
+
+    // row = z*262144 + y*512 + x, see geodesic.comp
+    const std::array<uint32_t, 3> elements = { std::min(nr, 512u), std::min(CEIL_DIV(nr, 512u), 512u), CEIL_DIV(nr, 262144u) };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, g, true),
+          ggml_vk_tensor_subbuffer(ctx, s, true), ggml_vk_tensor_subbuffer(ctx, b, true),
+          ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, elements);
+}
+
 void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -12698,6 +12828,16 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_MAMBA3_MIMO:
+        ggml_vk_mamba3_mimo(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_GEODESIC:
+        ggml_vk_geodesic(ctx, compute_ctx, node);
 
         break;
 
@@ -15896,6 +16036,117 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     }
                 }
                 return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_MAMBA3_MIMO:
+            {
+                // result form only; the in-place form (src[8] ids, src[9] cache) stays on the CPU
+                if (op->src[8] != nullptr || op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || op->view_offs % sizeof(float) != 0) {
+                    return false;
+                }
+                auto device = ggml_vk_get_device(ctx->device);
+                if (!ggml_vk_float_binding_supported(device, op)) {
+                    return false;
+                }
+                for (int i = 0; i < 8; i++) {
+                    const ggml_tensor * t = op->src[i];
+                    // a view has to start on a float: the shader addresses its buffers in floats
+                    if (t == nullptr || t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->view_offs % sizeof(float) != 0 ||
+                        ggml_is_empty(t) || !ggml_vk_float_binding_supported(device, t)) {
+                        return false;
+                    }
+                    // pdyn, pstat and the state are indexed by row; the weights must be contiguous
+                    if (i == 0 || i == 1 || i == 7) {
+                        if (t->nb[1] % sizeof(float) != 0 || ggml_n_dims(t) > 2) {
+                            return false;
+                        }
+                    } else if (!ggml_is_contiguous(t)) {
+                        return false;
+                    }
+                }
+                const ggml_tensor * pdyn  = op->src[0];
+                const ggml_tensor * pstat = op->src[1];
+                const ggml_tensor * bias  = op->src[2];
+                const ggml_tensor * state = op->src[7];
+                const int64_t D_qk   = bias->ne[0];
+                const int64_t D_v    = op->src[4]->ne[0];
+                const int64_t R      = op->src[4]->ne[1];
+                const int64_t H      = op->src[4]->ne[2];
+                const int64_t n_tok  = pdyn->ne[1];
+                const int64_t n_seqs = state->ne[1];
+                // the ranks the CPU reference implements
+                if ((R != 1 && R != 2 && R != 4 && R != 8) || D_qk % 4 != 0 || D_qk > 1024 || D_v > 256) {
+                    return false;
+                }
+                // the shapes ggml_mamba3_mimo asserts, in an order where the bounds above keep the products in range
+                // dst holds y, then the new state of each sequence packed as on the CPU
+                const int64_t n_embd_s = H*(D_v*D_qk + R*D_qk + R*D_v + D_qk/4);
+                if (bias->ne[1] != 2*R || bias->ne[2] != H ||
+                    op->src[3]->ne[0] != D_v || op->src[3]->ne[1] != 2*R || op->src[3]->ne[2] != H ||
+                    op->src[5]->ne[0] != D_qk || op->src[5]->ne[1] != 2 || op->src[6]->ne[0] != H || op->src[6]->ne[1] != 2 ||
+                    pdyn->ne[0] != 2*R*D_qk + D_qk/4 || pstat->ne[0] != (2*D_v + 3)*H || pstat->ne[1] != n_tok ||
+                    state->ne[0] != n_embd_s || n_tok % n_seqs != 0 || ggml_nelements(op) != D_v*H*n_tok + n_embd_s*n_seqs) {
+                    return false;
+                }
+                // one workgroup per (head, sequence)
+                if ((uint64_t) H > device->properties.limits.maxComputeWorkGroupCount[1] ||
+                    (uint64_t) n_seqs > device->properties.limits.maxComputeWorkGroupCount[2]) {
+                    return false;
+                }
+                if (ggml_vk_mamba3_mimo_shmem(R, D_qk, D_v) > device->properties.limits.maxComputeSharedMemorySize ||
+                    device->properties.limits.maxComputeWorkGroupInvocations < 256 ||
+                    device->properties.limits.maxComputeWorkGroupSize[0] < 256 ||
+                    device->properties.limits.maxPushConstantsSize < sizeof(vk_op_mamba3_mimo_push_constants)) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_GEODESIC:
+            {
+                const ggml_tensor * x = op->src[0];
+                const ggml_tensor * g = op->src[1];
+                for (int i = 0; i < 4; i++) {
+                    const ggml_tensor * t = op->src[i];
+                    // a view has to start on a float: the shader addresses its buffers in floats
+                    if (t == nullptr || t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float) || t->view_offs % sizeof(float) != 0) {
+                        return false;
+                    }
+                }
+                // x and g may be strided views; dst is written as contiguous rows
+                if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) || op->view_offs % sizeof(float) != 0 || ggml_is_empty(op) ||
+                    !ggml_are_same_shape(op, x) || !ggml_are_same_shape(x, g) ||
+                    ggml_nelements(op->src[2]) != 1 || ggml_nelements(op->src[3]) != 1) {
+                    return false;
+                }
+                for (const ggml_tensor * t : { x, g }) {
+                    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                        if (t->nb[i] % sizeof(float) != 0) {
+                            return false;
+                        }
+                    }
+                }
+                // the shader strides over a row in steps of 256 with a 32-bit index
+                if (x->ne[0] > UINT32_MAX - 256) {
+                    return false;
+                }
+                auto device = ggml_vk_get_device(ctx->device);
+                // the row sums are double, as on the CPU (see geodesic.comp)
+                if (!device->shader_float64) {
+                    return false;
+                }
+                // the binding bounds also bound every row offset and row count passed to the shader
+                if (!ggml_vk_float_binding_supported(device, op)) {
+                    return false;
+                }
+                for (int i = 0; i < 4; i++) {
+                    if (!ggml_vk_float_binding_supported(device, op->src[i])) {
+                        return false;
+                    }
+                }
+                // shared reduction scratch: 2*(256 + 16) doubles
+                return device->properties.limits.maxComputeSharedMemorySize >= 2*(256 + 16)*sizeof(double) &&
+                       device->properties.limits.maxComputeWorkGroupInvocations >= 256 &&
+                       device->properties.limits.maxComputeWorkGroupSize[0] >= 256 &&
+                       device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_geodesic_push_constants);
             }
         case GGML_OP_SSM_SCAN:
             {

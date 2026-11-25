@@ -728,6 +728,7 @@ struct vk_device_struct {
     bool subgroup_vote;
     bool multi_add;
     bool shader_int64;
+    bool shader_float64;
     bool buffer_device_address;
     bool vulkan_memory_model;
 
@@ -986,6 +987,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_geodesic_f32;
+    // key: {R, D_qk, D_v, invocations per state row, state in registers}
+    std::map<std::array<uint32_t, 5>, vk_pipeline> pipeline_mamba3_mimo_f32;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;

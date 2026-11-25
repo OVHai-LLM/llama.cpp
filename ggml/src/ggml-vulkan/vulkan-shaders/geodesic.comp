@@ -1,0 +1,109 @@
+#version 450
+
+// Olala geodesic residual (see ggml_geodesic in ggml.h), one workgroup per row:
+//   g_perp = g - (x.g/|x|^2) x
+//   theta  = min((min(|g_perp|/|x|, pi/4)*scale + bias)*inv_depth, pi/4)
+//   out    = x cos(theta) + (g_perp/|g_perp|) |x| sin(theta)
+// reference: ggml_compute_forward_geodesic (ggml/src/ggml-cpu/ops.cpp).
+//
+// The row sums are double, as on the CPU: near collinearity the normalization amplifies a one-ulp error in x.g/|x|^2.
+
+#define NTH  256
+#define NRED 16
+
+layout(local_size_x = NTH, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X     { float data_x[]; };
+layout(binding = 1) readonly buffer G     { float data_g[]; };
+layout(binding = 2) readonly buffer Scale { float data_s[]; };
+layout(binding = 3) readonly buffer Bias  { float data_b[]; };
+layout(binding = 4) buffer D              { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint o_x; uint o_g; uint o_s; uint o_b; uint o_d; // misalignment of each binding, in floats
+    uint n;                                           // row length
+    uint nr;                                          // number of rows
+    uint ne1; uint ne2;
+    uint sx1; uint sx2; uint sx3;                     // row strides of x and g, in floats; dst is contiguous
+    uint sg1; uint sg2; uint sg3;
+    float inv_depth;
+};
+
+shared double pa[NTH];
+shared double pb[NTH];
+shared double ra[NRED];
+shared double rb[NRED];
+
+// sums a and b over the workgroup (NTH -> NRED -> all); every invocation gets both totals
+void reduce(inout double a, inout double b) {
+    const uint tid = gl_LocalInvocationID.x;
+    pa[tid] = a;
+    pb[tid] = b;
+    barrier();
+    if (tid < NRED) {
+        double sa = 0.0, sb = 0.0;
+        for (uint i = 0; i < NTH / NRED; ++i) {
+            sa += pa[tid * (NTH / NRED) + i];
+            sb += pb[tid * (NTH / NRED) + i];
+        }
+        ra[tid] = sa;
+        rb[tid] = sb;
+    }
+    barrier();
+    a = 0.0;
+    b = 0.0;
+    for (uint i = 0; i < NRED; ++i) {
+        a += ra[i];
+        b += rb[i];
+    }
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (row >= nr) {
+        return; // whole workgroup: the grid is rounded up
+    }
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint i1 = row % ne1, i2 = (row / ne1) % ne2, i3 = row / (ne1 * ne2);
+    const uint xr = o_x + i1 * sx1 + i2 * sx2 + i3 * sx3;
+    const uint gr = o_g + i1 * sg1 + i2 * sg2 + i3 * sg3;
+    const uint yr = o_d + row * n;
+
+    double xx = 0.0, xg = 0.0;
+    for (uint i = tid; i < n; i += NTH) {
+        const double x = double(data_x[xr + i]);
+        xx += x * x;
+        xg += x * double(data_g[gr + i]);
+    }
+    reduce(xx, xg);
+
+    const float x_norm_sq = max(float(xx), 1e-12);
+    // a quotient of two floats rounded once from double is the correctly rounded float quotient
+    const float coef = float(double(float(xg)) / double(x_norm_sq));
+
+    double pp = 0.0, unused = 0.0;
+    for (uint i = tid; i < n; i += NTH) {
+        const float gp = data_g[gr + i] - coef * data_x[xr + i];
+        pp += double(gp) * double(gp);
+    }
+    reduce(pp, unused);
+
+    const float pi4      = 0.785398163;
+    const float tan_norm = max(sqrt(float(pp)), 1e-8);
+    const float xn       = sqrt(x_norm_sq);
+    float theta = min(tan_norm / max(xn, 1e-6), pi4);
+    theta = min((theta * data_s[o_s] + data_b[o_b]) * inv_depth, pi4);
+
+    // theta is only bounded from above; Vulkan's sin and cos are specified on [-pi, pi]
+    const double td = double(theta);
+    const float  tw = float(td - 6.283185307179586LF * roundEven(td * 0.15915494309189535LF));
+    const float  c  = cos(tw);
+    const float  s  = sin(tw) * xn / tan_norm;
+
+    // an invocation reads only the elements it writes, so dst may alias x or g
+    for (uint i = tid; i < n; i += NTH) {
+        const float x = data_x[xr + i];
+        data_d[yr + i] = x * c + (data_g[gr + i] - coef * x) * s;
+    }
+}

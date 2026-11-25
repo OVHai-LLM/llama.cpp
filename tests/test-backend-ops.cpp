@@ -4887,9 +4887,10 @@ struct test_mamba3_mimo : public test_case {
     const int64_t head_count;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
+    const bool    views; // projections and state are offset views, the projections with padded rows
 
     std::string vars() override {
-        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs) + (views ? ",views=1" : "");
     }
 
     double max_nmse_err() override {
@@ -4897,21 +4898,30 @@ struct test_mamba3_mimo : public test_case {
     }
 
     test_mamba3_mimo(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
-            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1, bool views = false)
         : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
-          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), views(views) {}
+
+    // a (ne0, ne1) view that starts one float into its buffer, with pad unused floats after every row
+    ggml_tensor * offset_view(ggml_context * ctx, int64_t ne0, int64_t ne1, int64_t pad) {
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (ne0 + pad)*ne1 + 1);
+        return ggml_view_2d(ctx, base, ne0, ne1, (ne0 + pad)*sizeof(float), sizeof(float));
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t H = head_count, n_tok = n_seq_tokens * n_seqs, n_ang = d_qk / 4;
         const int64_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + H*n_ang;
-        ggml_tensor * pdyn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
-        ggml_tensor * pstat  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_tensor * pdyn   = views ? offset_view(ctx, 2*r*d_qk + n_ang, n_tok, 3)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
+        ggml_tensor * pstat  = views ? offset_view(ctx, (2*d_v + 3)*H, n_tok, 5)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
         ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
         ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
         ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
         ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
         ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
-        ggml_tensor * state  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
+        ggml_tensor * state  = views ? offset_view(ctx, n_embd_s, n_seqs, 0)
+                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
         ggml_set_name(state, "state");
         return ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
     }
@@ -5030,6 +5040,71 @@ struct test_geodesic : public test_case {
         ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         return ggml_geodesic(ctx, x, g, scale, bias, inv_depth);
+    }
+};
+
+// GGML_OP_GEODESIC on independently strided 3D/4D views that start one float into their buffers
+struct test_geodesic_views : public test_case {
+    const int64_t n_embd;
+    const int64_t ne1, ne2, ne3;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, ne1, ne2, ne3);
+    }
+
+    test_geodesic_views(int64_t n_embd = 100, int64_t ne1 = 27, int64_t ne2 = 20, int64_t ne3 = 1)
+        : n_embd(n_embd), ne1(ne1), ne2(ne2), ne3(ne3) {}
+
+    ggml_tensor * view(ggml_context * ctx, int64_t pad0, int64_t pad1, int64_t pad2) {
+        const size_t nb1 = (n_embd + pad0)*sizeof(float);
+        const size_t nb2 = nb1*(ne1 + pad1);
+        const size_t nb3 = nb2*(ne2 + pad2);
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nb3*ne3/sizeof(float) + 1);
+        return ggml_view_4d(ctx, base, n_embd, ne1, ne2, ne3, nb1, nb2, nb3, sizeof(float));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = view(ctx, 3, 1, 2);
+        ggml_tensor * g     = view(ctx, 5, 2, 0);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        return ggml_geodesic(ctx, x, g, scale, bias, 0.5f);
+    }
+};
+
+// GGML_OP_GEODESIC on x = (1, 0), g = (0, 1): the row sums are exact and theta = bias.
+// theta is clamped only from above, so a negative bias reaches sin and cos unchanged.
+struct test_geodesic_angle : public test_case {
+    const float bias;
+
+    std::string vars() override {
+        return VARS_TO_STR1(bias);
+    }
+
+    test_geodesic_angle(float bias) : bias(bias) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 3);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 3);
+        ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x, "x");
+        ggml_set_name(g, "g");
+        ggml_set_name(s, "scale");
+        ggml_set_name(b, "bias");
+        return ggml_geodesic(ctx, x, g, s, b, 1.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<float> data(ggml_nelements(t), strcmp(t->name, "bias") == 0 ? bias : 0.0f);
+            if (strcmp(t->name, "x") == 0 || strcmp(t->name, "g") == 0) {
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = (i % 2 == 0) == (t->name[0] == 'x') ? 1.0f : 0.0f;
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
     }
 };
 
@@ -11824,10 +11899,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48,  1, 4)); // batched decode
     test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48, 96, 2)); // chunked prefill
     test_cases.emplace_back(new test_mamba3_mimo_cache_fusion( 16, 2,  8,  3, 33, 2)); // generic dims
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(  4, 1,  1,  1, 10, 1)); // y and the state have the same length
     test_cases.emplace_back(new test_geodesic(1536, 1, 1.0f));
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
     test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
+    test_cases.emplace_back(new test_geodesic_views(100, 27, 20, 1)); // 3D, 540 rows
+    test_cases.emplace_back(new test_geodesic_views( 64,  9,  8, 8)); // 4D, 576 rows
+    test_cases.emplace_back(new test_geodesic_angle(-3.5f));
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 1,  32,  4,   9, 2)); // rank 1
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 8,  16,  4,   9, 2)); // rank 8
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4,  64, 48, 512, 1)); // full ubatch
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4,  64, 48, 192, 2)); // multi-sequence prefill
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4,  64, 48,   3, 2)); // multi-sequence, short
+    test_cases.emplace_back(new test_mamba3_mimo(132, 2, 256,  2,   5, 2)); // d_qk not a multiple of 64
+    test_cases.emplace_back(new test_mamba3_mimo(132, 2, 256,  2,   5, 2, true)); // offset, padded views
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 4,  32,  3,   4, 3, true));
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4,  64, 48,   1, 1, true));
     // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Olala 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 1));
     test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 5));

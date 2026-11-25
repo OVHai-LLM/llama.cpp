@@ -705,6 +705,21 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+struct vk_op_mamba3_mimo_push_constants {
+    uint32_t o_pdyn, o_pstat, o_bias, o_mxz, o_mimo, o_norms, o_misc, o_state, o_dst;
+    uint32_t pdyn_s, pstat_s, s_in_s;
+    uint32_t H, T, n_embd_s, y_size;
+    float eps, a_floor;
+};
+
+struct vk_op_geodesic_push_constants {
+    uint32_t o_x, o_g, o_s, o_b, o_d;
+    uint32_t n, nr, ne1, ne2;
+    uint32_t sx1, sx2, sx3;
+    uint32_t sg1, sg2, sg3;
+    float inv_depth;
+};
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
